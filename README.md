@@ -23,8 +23,12 @@
 | `session.json` | 現在の会話ID。自動生成・外部公開対象外 |
 | `test/` | 会話継続、保存・復元、画像処理のテスト |
 | `.env` | Discordトークンなどの秘密設定。雛形は `.env.example` |
+| `com.hisho.discord-bot.plist.template` | launchd用の汎用テンプレート。Mac固有パスは含めない |
 
 ## Usage（使い方）
+
+`.env.example` を `.env` にコピーし、`DISCORD_TOKEN` を設定します。
+`CLAUDE_CWD` と `CLAUDE_BIN` は、そのMacの絶対パスへ置き換えます。
 
 ```bash
 npm start
@@ -68,5 +72,17 @@ Claude側の利用上限やログイン切れでは会話IDを消さず、Discor
 ```bash
 npm test
 ```
+
+## 常駐化（自動起動）
+
+`com.hisho.discord-bot.plist.template` の次の印を各Macの値へ置き換え、
+`~/Library/LaunchAgents/com.hisho.discord-bot.plist` として保存します。
+
+- `__NODE_BIN__`: `node` 実行体の絶対パス
+- `__BOT_DIR__`: このリポジトリの絶対パス
+- `__PATH__`: Botへ渡す実行検索パス
+- `__HOME__`: そのMacのホームディレクトリ
+
+生成後の `.plist` はMac固有ファイルのためGitへ含めません。
 
 秘密設定と `session.json` は共有・公開しないでください。

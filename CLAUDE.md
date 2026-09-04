@@ -9,4 +9,6 @@
 - 自動更新を始めるときは、先にDiscordへ途中経過を伝える。
 - 画像はDiscord公式CDNの添付URLだけを取りに行く。リダイレクトは追わず、
   読み取りながら容量上限で打ち切り、実ファイルの中身から形式を判定する。
+- Claude実行体と作業場所は、各Macの `.env` にある `CLAUDE_BIN` と `CLAUDE_CWD` で指定する。
+- 自動起動設定は `.plist.template` から各Mac用に生成し、実ファイルはGitへ含めない。
 - 本番反映は `com.hisho.discord-bot` LaunchAgentの再起動後に `bot.log` で確認する。
