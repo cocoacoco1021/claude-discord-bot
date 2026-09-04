@@ -2,4 +2,6 @@ node_modules/
 .env
 paired.json
 session.json
+session.json.tmp
+handoffs/
 *.log

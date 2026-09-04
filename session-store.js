@@ -1,4 +1,12 @@
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  existsSync,
+  readFileSync,
+  renameSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
+import { fileURLToPath } from "node:url";
 
 const CLAUDE_SESSION_ID_PATTERN =
   /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -19,16 +27,22 @@ export class SessionStoreError extends Error {
   }
 }
 
+/** URLでもパス文字列でも受け取れるようにする。 */
+function toFilePath(filePath) {
+  return filePath instanceof URL ? fileURLToPath(filePath) : String(filePath);
+}
+
 /**
  * 役割: 保存済みのClaude会話状態を読み込む。
  * 入力: 保存ファイルのパスまたはURL。
  * 出力: 検証済み状態。旧形式は初回更新待ちへ移行する。
  */
 export function loadSessionState(filePath) {
-  if (!existsSync(filePath)) return { ...EMPTY_SESSION_STATE };
+  const targetPath = toFilePath(filePath);
+  if (!existsSync(targetPath)) return { ...EMPTY_SESSION_STATE };
 
   try {
-    const savedSession = JSON.parse(readFileSync(filePath, "utf8"));
+    const savedSession = JSON.parse(readFileSync(targetPath, "utf8"));
     validateSessionId(savedSession.sessionId);
 
     // 旧版は利用量を持たないため、次の依頼前に一度だけ要約更新する。
@@ -58,12 +72,16 @@ export function loadSessionState(filePath) {
  * 役割: Claude会話状態を再起動後も使えるよう保存する。
  * 入力: 保存ファイルのパスまたはURL、検証対象の状態。
  * 出力: なし。保存失敗時はSessionStoreErrorを送出する。
+ * 実装メモ: 一時ファイルへ書いてから rename する。書き込みの途中で電源が落ちても、
+ *           本体の session.json が中途半端な内容になることはない（原子的な差し替え）。
  */
 export function saveSessionState(filePath, sessionState) {
+  const targetPath = toFilePath(filePath);
+  const temporaryPath = `${targetPath}.tmp`;
   try {
     validateSessionState(sessionState);
     writeFileSync(
-      filePath,
+      temporaryPath,
       `${JSON.stringify(
         { version: SESSION_STATE_VERSION, ...sessionState },
         null,
@@ -71,7 +89,16 @@ export function saveSessionState(filePath, sessionState) {
       )}\n`,
       { encoding: "utf8", mode: 0o600 },
     );
+    // 前回の一時ファイルが緩い権限で残っていた場合に備えて権限を明示し直す。
+    chmodSync(temporaryPath, 0o600);
+    renameSync(temporaryPath, targetPath);
+    chmodSync(targetPath, 0o600);
   } catch (error) {
+    try {
+      rmSync(temporaryPath, { force: true });
+    } catch {
+      /* 後始末の失敗は本来のエラーを隠さない */
+    }
     throw new SessionStoreError("Claude会話状態の保存に失敗しました", error);
   }
 }

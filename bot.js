@@ -5,6 +5,7 @@
 
 import { spawn } from "node:child_process";
 import { readFileSync, writeFileSync, existsSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 
 import "dotenv/config";
 import { Client, GatewayIntentBits, Partials, Events } from "discord.js";
@@ -18,9 +19,14 @@ import {
 import {
   cleanupDownloadedImages,
   downloadDiscordImages,
+  isSupportedImageAttachment,
   loadImageSettings,
 } from "./discord-images.js";
-import { SessionLifecycle } from "./session-lifecycle.js";
+import { saveHandoffSummary } from "./handoff-archive.js";
+import {
+  SessionLifecycle,
+  SessionLifecycleError,
+} from "./session-lifecycle.js";
 import {
   loadSessionPolicy,
   parseSessionCommand,
@@ -47,7 +53,8 @@ const SYSTEM_PROMPT =
   "返答は日本語で、スマホで読みやすいよう簡潔にする。" +
   "お金の支払い・購入、メールやメッセージの送信、ファイルの削除、外部への公開など" +
   "『取り消せない操作・外部に影響する操作』は、実行する前に必ずDiscordで内容を伝えて確認を取ること。" +
-  "確認が取れるまでは実行しない。";
+  "確認が取れるまでは実行しない。" +
+  "Discordブリッジが画像の一時保存先を示した場合は、回答前にReadツールですべて開いて内容を確認すること。";
 
 // 起動時の設定チェック（早期に失敗させて原因を明示する）
 if (!TOKEN) {
@@ -58,6 +65,8 @@ if (!TOKEN) {
 const PAIR_FILE = new URL("./paired.json", import.meta.url);
 // Claudeの会話ID。再起動後も同じ会話をresumeするために保存する。
 const SESSION_FILE = new URL("./session.json", import.meta.url);
+// 引き継ぎ要約の保管場所。過去の要約は消さずに残す。
+const HANDOFF_DIR = fileURLToPath(new URL("./handoffs/", import.meta.url));
 
 function loadPairedId() {
   try {
@@ -116,6 +125,8 @@ const sessionLifecycle = new SessionLifecycle({
   persistState: persistSessionState,
   invokeClaude,
   shouldRetryWithoutSession,
+  // 要約は日時つきで残す。古い要約には触らない。
+  archiveHandoff: (summary) => saveHandoffSummary(HANDOFF_DIR, summary),
 });
 
 // 同時に複数の claude を走らせないための直列キュー（セッション競合を防ぐ）
@@ -145,13 +156,15 @@ client.once(Events.ClientReady, (c) => {
     sessionState.sessionId
       ? sessionState.rotationPending
         ? "[INFO] 旧会話を次の依頼前に要約して更新します"
-        : "[INFO] 保存済みのClaude会話を継続します"
+        : `[INFO] 保存済みのClaude会話を継続します: ${sessionState.sessionId}` +
+          `（依頼${sessionState.requestCount}件 / 文脈約${sessionState.contextTokens}トークン）`
       : "[INFO] 新しいClaude会話を開始します",
   );
   console.log(
     `[INFO] 自動更新: ${SESSION_POLICY.maxRequests}件 または ` +
       `${SESSION_POLICY.maxContextTokens}トークン`,
   );
+  console.log(`[INFO] 引き継ぎ要約の保管先: ${HANDOFF_DIR}`);
 });
 
 /**
@@ -218,13 +231,24 @@ function invokeClaude({ prompt, sessionId, imagePaths }) {
 async function runSessionCommand(sessionCommand) {
   if (sessionCommand === "fresh") {
     sessionLifecycle.rotateFresh();
-    return "✅ 引き継ぎなしの新しいセッションへ切り替えました。過去ログは削除していません。";
+    return "🆕 引き継ぎなしの新しいセッションへ切り替えました。過去の会話の記録は消していません。";
   }
 
-  const rotated = await sessionLifecycle.rotateWithHandoff();
-  return rotated
-    ? "✅ 引き継ぎ要約を作り、新しいセッションへ切り替えました。"
-    : "ℹ️ すでに新しいセッションです。";
+  try {
+    const result = await sessionLifecycle.rotateWithHandoff();
+    if (!result.rotated) return "ℹ️ すでに新しいセッションです。";
+    return (
+      `🆕 引き継ぎ要約（${result.summaryLength}文字）を作り、新しいセッションへ切り替えました。\n` +
+      "前の会話の記録は消していません。" +
+      (result.archivedPath ? `\n要約の保管先: ${result.archivedPath}` : "")
+    );
+  } catch (error) {
+    if (error instanceof SessionLifecycleError) {
+      console.error("[WARN] セッション更新に失敗:", error.message);
+      return `⚠️ セッションを更新できませんでした。今の会話をそのまま続けます。\n理由: ${error.message}`;
+    }
+    throw error;
+  }
 }
 
 /**
@@ -239,6 +263,23 @@ async function sendChunked(message, text) {
     if (i === 0) await message.reply(chunk);
     else await message.channel.send(chunk);
   }
+}
+
+/** 自動更新の結果を、返答の前置きにする。何も起きていなければ空文字。 */
+function buildRotationNotice(rotation) {
+  if (rotation.error) {
+    return (
+      "⚠️ セッションを更新できませんでした。今の会話をそのまま続けます。\n" +
+      `理由: ${rotation.error.message}\n\n`
+    );
+  }
+  if (rotation.rotated) {
+    return (
+      `♻️ 引き継ぎ要約（${rotation.summaryLength}文字）を渡して、新しいセッションに切り替えました。\n` +
+      "前の会話の記録は消していません。\n\n"
+    );
+  }
+  return "";
 }
 
 client.on(Events.MessageCreate, (message) => {
@@ -267,7 +308,16 @@ client.on(Events.MessageCreate, (message) => {
   if (message.author.id !== allowedUserId) return; // 許可ユーザー以外は完全無視
   const content = message.content?.trim() || "";
   const attachments = [...message.attachments.values()];
-  if (!content && attachments.length === 0) return;
+  // 対応外の添付は無視して本文だけ処理する（動画1本で依頼ごと落とさない）
+  const imageAttachments = attachments.filter(isSupportedImageAttachment);
+  if (!content && imageAttachments.length === 0) {
+    if (attachments.length > 0) {
+      message
+        .reply("画像は PNG・JPEG・WebP 形式で送ってください。")
+        .catch(() => {});
+    }
+    return;
+  }
   const sessionCommand = parseSessionCommand(content);
 
   // 直列キューに積んで順番に処理（同時実行によるセッション競合を防ぐ）
@@ -286,16 +336,29 @@ client.on(Events.MessageCreate, (message) => {
         return;
       }
 
-      downloadedImages = await downloadDiscordImages(attachments, IMAGE_SETTINGS);
+      downloadedImages = await downloadDiscordImages(
+        imageAttachments,
+        IMAGE_SETTINGS,
+      );
       const prompt = content || DEFAULT_IMAGE_PROMPT;
       const claudeResult = await sessionLifecycle.runOwnerPrompt(
         prompt,
         downloadedImages.imagePaths,
+        {
+          // 自動更新は数分かかることがあるので、始める前に途中経過を伝える
+          onRotationStart: async (reason) => {
+            await message.channel
+              .send(
+                `🔄 ${reason}。引き継ぎ要約を作って、新しいセッションに切り替えます…`,
+              )
+              .catch(() => {});
+          },
+        },
       );
-      const reply = claudeResult.rotated
-        ? `♻️ 会話履歴を要約して新しいセッションへ切り替えました。\n\n${claudeResult.text}`
-        : claudeResult.text;
-      await sendChunked(message, reply);
+      await sendChunked(
+        message,
+        buildRotationNotice(claudeResult.rotation) + claudeResult.text,
+      );
     } catch (e) {
       const detail = String(e?.message || e).slice(0, 1800);
       await message.reply(`⚠️ エラーが発生しました:\n\`\`\`\n${detail}\n\`\`\``).catch(() => {});
